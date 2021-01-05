@@ -1,0 +1,6 @@
+
+name = Wiski
+description = Functionaliteiten specifiek voor Wisk
+core = 7.x
+dependencies[] = rules
+scripts[] = js/wiski.js

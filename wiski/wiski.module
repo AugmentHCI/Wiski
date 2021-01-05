@@ -1,0 +1,1110 @@
+<?php
+/**
+* Volgorde waarin functies worden opgeroepen bij het oplossen van een quiz:
+*  - Start quiz: alter
+*  - Fout antwoord: validate + ajax + alter
+*  - Juist antwoord en naar volgende vraag: validate + submit + ajax + alter
+*  - Resultaten quiz: validate + submit + ajax
+*/
+
+/**
+* Geef pagina's weer voor de beheerder zoals voor de gebruikers.
+*/
+function wiski_admin_paths_alter(&$paths) {
+  // Treat all user pages as not administrative.
+  $paths['user/*'] = FALSE;
+}
+
+/**
+* Wijzig het standaard antwoordformulier voor quizvragen.
+*/
+function wiski_form_quiz_question_answering_form_alter(&$form, &$form_state, $form_id) {
+  $question_number = key($form['question']);
+  $flag = flag_get_flag('hulp_gevraagd');
+  $hulp_gevraagd = $flag->is_flagged($question_number);
+
+  // Verwijder de titel van de vraag.
+  unset($form['question'][$question_number]['header']);
+
+  // Verwijder de titel bij de opties.
+  unset($form['question'][$question_number]['answer']['user_answer']['#title']);
+
+  // Knop voor het overslaan van een oefening opmaken.
+  $form['navigation']['skip']['#access'] = $hulp_gevraagd;
+  $form['navigation']['skip']['#value'] = t('Overslaan');
+  $form['navigation']['skip']['#attributes'] = array('class' => array('button-filled'));
+
+  if ($hulp_gevraagd) {
+    $form['navigation']['submit']['#access'] = FALSE;
+  } elseif (!empty($form_state['correct'])) {
+    $form['navigation']['submit']['#value'] = t('Volgende');
+  } else {
+    $form['navigation']['submit']['#value'] = t('Controleren');
+    $form['navigation']['submit']['#disabled'] = TRUE;
+  }
+
+  // Voeg hulpknop toe.
+  $form['navigation']['help'] = array(
+    '#weight' => '10',
+    '#type' => 'button',
+    '#value' => 'Vraag hulp',
+    '#attributes' => array('class' => array('button-empty')),
+    '#access' => !$hulp_gevraagd,
+  );
+
+  $form['navigation']['#prefix'] = '<div class="quiz-footer">';
+  $form['navigation']['#suffix'] = '</div>';
+
+  // Deel de question footer in met feedback en knoppen.
+  $actions = element_children($form['navigation']);
+  foreach ($actions as $action) {
+    $form['navigation']['actions'][$action] = $form['navigation'][$action];
+    unset($form['navigation'][$action]);
+  }
+  $form['navigation']['actions']['#type'] = 'actions';
+  unset($form['navigation']['#type']);
+
+  $form['navigation']['feedback'] = array(
+    '#type' => 'container',
+    '#attributes' => array(
+      'class' => array('question-feedback'),
+    ),
+  );
+
+  // Voeg feedback toe voor foute antwoorden.
+  $form['navigation']['feedback']['wrong'] = array(
+    '#access' => FALSE,
+    '#markup' => wiski_question_feedback_render('wrong', $form_state),
+  );
+
+  if (!empty($form_state['correct'])) {
+    // Voeg feedback toe voor juiste antwoorden.
+    $form['navigation']['feedback']['correct'] = array(
+      '#access' => FALSE,
+      '#markup' => wiski_question_feedback_render('correct', $form_state),
+    );
+  }
+
+  // Voeg feedback toe voor overslaan nadat de gebruiker hulp vroeg.
+  $form['navigation']['feedback']['overslaan'] = array(
+    '#access' => $hulp_gevraagd,
+    '#markup' => t('
+    <p>Je hebt hulp gevraagd bij deze oefening.</p>
+    <p>Je krijgt een bericht wanneer iemand reageert op je vraag.</p>
+    '),
+  );
+  if ($hulp_gevraagd) {
+    $form['navigation']['#prefix'] = '<div class="quiz-footer correct">';
+  }
+
+  // AJAX voor acties.
+  $ajax = array(
+    'callback' => 'wiski_ajax_navigate_quiz',
+  );
+  $form['navigation']['actions']['submit_hidden']['#ajax'] = $ajax;
+  $form['navigation']['actions']['submit']['#ajax'] = $ajax;
+
+  // Aangepast gedrag voor valideren van een antwoord.
+  unset($form['#validate'][0]);
+  $form['question'][$question_number]['answer']['#element_validate'][0] = 'wiski_element_validate';
+
+  // Aangepast gedrag voor indienen van een antwoord.
+  $form['#submit'][0] = 'wiski_answering_form_submit';
+}
+
+function wiski_question_feedback_render($string, $form_state) {
+  global $user;
+  $account = user_load($user->uid);
+  $motivatie = $account->field_motiverende_feedback['und']['0']['value'];
+  $punten = $account->field_points['und']['0']['value'];
+  $verdiend = '';
+  $transactie = views_get_view_result('laatste_puntentransactie', 'master', $user->uid);
+  $score = current($transactie)->userpoints_txn_points;
+
+  if ($string == 'correct') {
+    if ($punten) {
+      $verdiend = " (+{$score} punten)";
+    }
+    $text = "<h2>Correct{$verdiend}</h2>";
+    if ($motivatie) {
+      $text .= wiski_motivationele_feedback_correct();
+    }
+  } else {
+    if ($punten) {
+      $verdiend = " ({$score} punten)";
+    }
+    $text = "<h2>Fout{$verdiend}</h2>";
+    if ($motivatie) {
+      $text .= wiski_motivationele_feedback_fout();
+    }
+    $text .= '<p>Probeer het nog eens of vraag hulp.</p>';
+  }
+  return '<div class="question-evaluation question-' . $string . '">
+  <div class="image-evaluation-background">
+  <div class="image-evaluation image-' . $string . '"></div>
+  </div>
+  <div class="question-evaluation-text">' . $text . '</div>
+  </div>';
+}
+
+function wiski_motivationele_feedback_correct() {
+  $feedback[] = 'Pri(s)ma resultaat!';
+  $feedback[] = 'Helemaal juist, niet gebuisd!';
+  $feedback[] = 'Top-$\pi$!';
+  $feedback[] = 'Joe-$\pi$, dat is juist!';
+  $feedback[] = 'Klopt als een plus!';
+  $feedback[] = 'Reken maar van yes!';
+  $feedback[] = 'Machtig goed gedaan, blijven gaan!';
+  $feedback[] = 'Woehoe, je statistieken verbeteren exponentieel!';
+  $feedback[] = '100% correct!';
+  $feedback[] = 'Zo word je een echte wiskundige!';
+  $feedback[] = 'Je hebt het bij het rechte eind!';
+  $feedback[] = 'Correct in het kwadraat!';
+  $feedback[] = 'Je hebt bewezen dat je het begrijpt!';
+  $feedback[] = 'Jij functioneert maximaal!';
+  $feedback[] = '$\text{jij}+\text{wiskunde}=\text{de max}!$';
+  return wiski_random_entry($feedback);
+}
+
+function wiski_motivationele_feedback_fout() {
+  $feedback[] = 'Woeps, dat ziet er niet juist uit...';
+  $feedback[] = 'Dat is zo juist als $1+1=3$...';
+  $feedback[] = 'Je antwoord is eerder miskunde dan wiskunde...';
+  $feedback[] = 'Op die oplossing moet je niet rekenen...';
+  $feedback[] = 'Hmm, dat antwoord heeft weinig inhoud...';
+  $feedback[] = 'Ja, ja, en vierkanten zijn rond...';
+  $feedback[] = 'Ai, je bent de $\pi$-neut...';
+  $feedback[] = 'Het lijkt erop dat je wat afgeleid was...';
+  $feedback[] = 'Die oplossing is integraal fout...';
+  $feedback[] = 'Zelfs de beste wiskundigen kunnen weleens verkeerd zijn...';
+  $feedback[] = 'Dat reken je best nog eens na...';
+  $feedback[] = 'Je zit toch nog niet aan de limiet van je kunnen?';
+  $feedback[] = "Dat valt onder de noemer 'fout'...";
+  $feedback[] = 'Hopelijk gaan die fouten zich niet vermenigvuldigen...';
+  $feedback[] = 'Foute coördinaten voor de correcte bestemming...';
+  return wiski_random_entry($feedback);
+}
+
+function wiski_random_entry($array) {
+  $entry = $array[array_rand($array)];
+  return '<p>' . check_markup($entry, 'full_html') . '</p>';
+}
+
+/**
+* Element validator (for repeat until correct).
+*/
+function wiski_element_validate(&$element, &$form_state) {
+  $question_nid = $element['#array_parents'][1];
+  $current_question = node_load($question_nid);
+  $quiz = node_load($form_state['complete form']['#quiz']['nid'], $form_state['complete form']['#quiz']['vid']);
+
+  if ($form_state['clicked_button']['#value'] == 'Vraag hulp') {
+    rules_invoke_event('hulppagina_bekeken_tijdens_quiz', $current_question, $quiz);
+  } else {
+    $answer = $form_state['values']['question'][$question_nid]['answer'];
+
+    // There was an answer submitted.
+    $result = _quiz_question_response_get_instance($_SESSION['quiz'][$quiz->nid]['result_id'], $current_question, $answer);
+
+    // Fout antwoord
+    if ($quiz->repeat_until_correct && !$result->isCorrect() && $result->isEvaluated()) {
+      // Verander status naar FALSE.
+      form_error($element, t(''));
+      $form_state['correct'] = FALSE;
+      // Roep regel op
+      $quiz_result_answer = entity_load_single('quiz_result_answer', $result->result_answer_id);
+      rules_invoke_event('meerkeuzevraag_fout_beantwoord', $quiz_result_answer);
+    }
+  }
+}
+
+/**
+* Submit handler for the question answering form.
+*
+* There is no validation code here, but there may be feedback code for
+* correct feedback.
+*/
+function wiski_answering_form_submit(&$form, &$form_state) {
+  $quiz_result = quiz_result_load($_SESSION['quiz'][$form['#quiz']['nid']]['result_id']);
+  $quiz = node_load($quiz_result->nid, $quiz_result->vid);
+  $questions = $quiz_result->getLayout();
+
+  if (!empty($form_state['correct'])) {
+    unset($form_state['correct']);
+  } else {
+    $form_state['correct'] = TRUE;
+  }
+
+  if (!empty($form_state['values']['question'])) {
+    foreach ($form_state['values']['question'] as $nid => $response) {
+      $answer = $response['answer'];
+      foreach ($questions as $question) {
+        if ($question['nid'] == $nid) {
+          $question_array = $question;
+          $current_question = node_load($question['nid'], $question['vid']);
+        }
+      }
+      $qi_instance = _quiz_question_response_get_instance($_SESSION['quiz'][$quiz->nid]['result_id'], $current_question, $form_state['values']['question'][$current_question->nid]['answer']);
+      $qi_instance->is_skipped = FALSE;
+      $qi_instance->save();
+      $result = $qi_instance->toBareObject();
+      $result->is_doubtful = !empty($response['is_doubtful']);
+      quiz_store_question_result($quiz, $result, array('question_data' => $question_array));
+
+      // Increment the counter.
+      quiz_question_goto($quiz, $_SESSION['quiz'][$quiz->nid]['current'] + 1);
+    }
+  }
+
+  $layout = $quiz_result->getLayout();
+  $last = !isset($layout[$_SESSION['quiz'][$quiz->nid]['current']]) && !isset($form_state['correct']);
+  if ($last) {
+    // If this is the last question, finalize the quiz.
+    quiz_question_answering_form_finalize($form, $form_state);
+  }
+}
+
+/**
+* AJAX callback for quiz submission.
+*/
+function wiski_ajax_navigate_quiz($form, &$form_state) {
+  ctools_include('ajax');
+  // Array for ajax commands to return.
+  $commands = array();
+
+  // Get the quiz result.
+  $quiz_result = FALSE;
+  if (isset($form['#quiz_result'])) {
+    $quiz_result = $form['#quiz_result'];
+  }
+  // Is there a temp result?
+  elseif (isset($quiz_session['temp']['result_id'])) {
+    $quiz_result = quiz_result_load($quiz_session['temp']['result_id']);
+  }
+
+  // Get the quiz.
+  $quiz = FALSE;
+  if ($quiz_result) {
+    $quiz = node_load($quiz_result->nid, $quiz_result->vid);
+  }
+
+  // Get quiz session.
+  $quiz_session = $_SESSION['quiz'];
+
+  // Get question number.
+  $question_number = 0;
+  if ($quiz && isset($quiz_session[$quiz->nid]['current'])) {
+    $question_number = $quiz_session[$quiz->nid]['current'];
+    // Feedback? reduce the question number.
+    // This is because the quiz has already progressed the question counter.
+    if (!empty($form_state['correct'])) {
+      $question_number--;
+    }
+  }
+
+  // Have a quiz result and valid question?
+  $layout = $quiz_result->getLayout();
+  if ($quiz_result && isset($layout[$question_number])) {
+    // Figure out current question.
+    $question = $layout[$question_number];
+    // Load the question.
+    $question_node = node_load($question['nid'], $question['vid']);
+
+    // Have a question node?
+    if ($question_node) {
+      // Update build state question for form rebuilding.
+      $form_state['build_info']['args'][0] = $question_node;
+      // Mark this as the current question in the session.
+      quiz_question_goto($quiz, $question_number);
+      // Added the progress info to the view.
+      $questions = array();
+      $i = 0;
+      foreach ($quiz_result->getLayout() as $idx => $question) {
+        $questions[$idx] = ++$i;
+      }
+
+      // Rebuild for next question.
+      $form_state['cache'] = FALSE;
+      $form_state['rebuild'] = TRUE;
+      $form = drupal_rebuild_form($form['#form_id'], $form_state, $form);
+
+      // Give appropriate class to question footer.
+      if (!isset($form_state['correct'])) {
+        $commands[] = ctools_ajax_command_redirect('node/' . $quiz->nid . '/take');
+        $form['navigation']['#prefix'] = '<div class="quiz-footer">';
+        $form['navigation']['feedback']['correct']['#access'] = FALSE;
+        $form['navigation']['feedback']['wrong']['#access'] = FALSE;
+      } elseif ($form_state['correct']) {
+        $form['navigation']['#prefix'] = '<div class="quiz-footer correct">';
+        $form['navigation']['feedback']['correct']['#access'] = TRUE;
+        $form['navigation']['feedback']['wrong']['#access'] = FALSE;
+
+        $commands[] = ajax_command_replace(".answering-form", drupal_render($form));
+      } else {
+        $form['navigation']['#prefix'] = '<div class="quiz-footer wrong">';
+        $form['navigation']['feedback']['correct']['#access'] = FALSE;
+        $form['navigation']['feedback']['wrong']['#access'] = TRUE;
+        $form['navigation']['actions']['submit']['#attributes'] = array('class' => array('button-red'));
+
+        $commands[] = ajax_command_replace(".answering-form", drupal_render($form));
+      }
+    }
+  }
+  // Only have a result?
+  elseif ($quiz_result) {
+    // If there is a quiz result, but no current question. Completed quiz.
+    $commands[] = ctools_ajax_command_redirect('oefenen-resultaat/' . $quiz_result->result_id);
+  }
+  // No result, but have a quiz?
+  else {
+    // don't know what to do redirect back to quiz.
+    $commands[] = ctools_ajax_command_redirect('node/' . $quiz->nid);
+  }
+
+  // Return ajax commands.
+  return array('#type' => 'ajax', '#commands' => $commands);
+}
+
+/**
+* Indienen van webforms.
+*/
+function wiski_webform_submission_insert($node, $submission) {
+  global $user;
+  $data = $submission->data[1];
+
+  if ($node->title == 'Hexad') {
+    // Verwerk de resultaten van de webform 'Hexad'
+    $ph = $data[4] + $data[10] + $data[22] + $data[25];
+    $s = $data[8] + $data[15] + $data[17] + $data[24];
+    $f = $data[5] + $data[14] + $data[16] + $data[18];
+    $a = $data[3] + $data[6] + $data[12] + $data[20];
+    $d = $data[1] + $data[7] + $data[9] + $data[23];
+    $p = $data[11] + $data[19] + $data[21] + $data[2];
+
+    $user->field_philanthropist['und'][0]['value'] = $ph;
+    $user->field_socialiser['und'][0]['value'] = $s;
+    $user->field_free_spirit['und'][0]['value'] = $f;
+    $user->field_achiever['und'][0]['value'] = $a;
+    $user->field_disruptor['und'][0]['value'] = $d;
+    $user->field_player['und'][0]['value'] = $p;
+    user_save($user);
+  } elseif ($node->title == 'BFI-44') {
+    // Verwerk de resultaten van de webform 'BFI-44'
+    $o = ($data[5] + $data[10] + $data[15] + $data[20] + $data[26] + $data[31] + (6-$data[36]) + $data[41] + (6-$data[42]) + $data[45]) / 10;
+    $c = ($data[3] + (6-$data[8]) + $data[13] + (6-$data[18]) + (6-$data[24]) + $data[29] + $data[34] + $data[39] + (6-$data[44])) / 9;
+    $e = ($data[1] + (6-$data[6]) + $data[11] + $data[16] + (6-$data[21]) + $data[27] + (6-$data[32]) + $data[37]) / 8;
+    $a = ((6-$data[2]) + $data[7] + (6-$data[12]) + $data[17] + $data[22] + (6-$data[28]) + $data[33] + (6-$data[38]) + $data[43]) / 9;
+    $n = ($data[4] + (6-$data[9]) + $data[14] + $data[19] + (6-$data[25]) + $data[30] + (6-$data[35]) + $data[40]) / 8;
+
+    $user->field_openness['und'][0]['value'] = $o;
+    $user->field_conscienciousness['und'][0]['value'] = $c;
+    $user->field_extraversion['und'][0]['value'] = $e;
+    $user->field_agreeableness['und'][0]['value'] = $a;
+    $user->field_neuroticism['und'][0]['value'] = $n;
+    user_save($user);
+  }
+}
+
+/**
+* Importeer alle oefeningen van Die Keure.
+*/
+function wiski_import_exercises() {
+  for ($i = 1; $i < 7; $i++) {
+    $path = variable_get('file_public_path', conf_path() . '/files/oefeningen/' . $i);
+    if (is_dir($path)) {
+      wiski_import_year_exercises($i);
+    }
+  }
+}
+
+/**
+* Importeer alle oefeningen van een specifiek jaar van Die Keure.
+*/
+function wiski_import_year_exercises($jaar) {
+  $path = variable_get('file_public_path', conf_path()) . '/files/oefeningen/' . $jaar;
+  $reeksen = new DirectoryIterator($path);
+  foreach ($reeksen as $reeks) {
+    if ($reeks->isDir() && !$reeks->isDot()) {
+      $reeks = $reeks->getFilename();
+      wiski_create_multichoices($jaar, $reeks);
+    } elseif ($reeks->getExtension() == 'zip') {
+      $reeks = $reeks->getBasename('.zip');
+      wiski_unzip_files($jaar, $reeks);
+      wiski_create_multichoices($jaar, $reeks);
+    }
+  }
+}
+
+/**
+* Unzip jpg-afbeeldingen en exercise.xml uit een zip-bestand met een
+* oefeningenreeks van Die Keure. Verwijder nadien de zip.
+*/
+function wiski_unzip_files($jaar, $reeks) {
+  $path = variable_get('file_public_path', conf_path()) . '/files/oefeningen/' . $jaar;
+  $zippath = $path . '/' . $reeks . '.zip';
+  $zip = new ZipArchive;
+  if ($zip->open($zippath)) {
+    $files = array('exercise.xml');
+    for($i = 0; $i < $zip->numFiles; $i++) {
+      $file = $zip->getNameIndex($i);
+      if (preg_match('#^[^/]+\.jpg#', $file)) {
+        $files[] = $file;
+      }
+    }
+    $zip->extractTo($path . '/' . $reeks, $files);
+    $zip->close();
+    unlink($zippath);
+  }
+}
+
+/**
+* Maak multichoices op basis van een oefeningenreeks van Die Keure. Zorg er in het
+* tekstbestand van de reeks voor dat de laatste eigenschap van elke oefening 'Correct' is.
+*/
+function wiski_create_multichoices($jaar, $reeks) {
+  $info = wiski_read_series_info($jaar, $reeks);
+  foreach ($info['oefeningen'] as $oefening) {
+    wiski_create_multichoice($jaar, $info['categorie'], $oefening);
+  }
+}
+
+/**
+* Lees de informatie van de oefeningenreeks in.
+*/
+function wiski_read_series_info($jaar, $reeks) {
+  wiski_convert_xml_to_txt($jaar, $reeks);
+  $path = variable_get('file_public_path', conf_path() . '/files') . '/oefeningen/' . $jaar . '/' . $reeks;
+  $file = fopen($path . '/oefeningen.txt', 'r');
+
+  while(!feof($file)) {
+    $line = fgets($file);
+    if (preg_match('/(\S+):(\S.*)/', $line, $matches)) {
+      switch ($matches[1]) {
+        case 'Categorie':
+        $info['categorie'] = $matches[2];
+        break;
+        case 'Opdracht':
+        $oefening['opdracht'] = $matches[2];
+        break;
+        case 'Opgave':
+        $oefening['opgave'] = $matches[2];
+        break;
+        case 'Optie':
+        $oefening['opties'][] = $matches[2];
+        break;
+        case 'Correct':
+        $oefening['correct'] = explode(',', $matches[2]);
+        $info['oefeningen'][] = $oefening;
+        unset($oefening);
+        break;
+      };
+    }
+  }
+  fclose($file);
+  return $info;
+}
+
+/**
+* Converteer een oefeningenreeks van Die Keure in xml-formaat naar een txt-formaat.
+*/
+function wiski_convert_xml_to_txt($jaar, $reeks) {
+  $path = variable_get('file_public_path', conf_path() . '/files') . '/oefeningen/' . $jaar . '/'. $reeks;
+  $xml = file_get_contents($path . '/exercise.xml');
+  $txt = fopen($path . '/oefeningen.txt', 'w');
+
+  // Sla de categorie op.
+  preg_match('/category="(.+)"/', $xml, $matches);
+  fwrite($txt, 'Categorie:' . $matches[1] . "\n\n");
+
+  // Sla de oefeningen op.
+  preg_match_all('#<question([\S\s]+?)</question>#', $xml, $matches);
+  foreach ($matches[0] as $match) {
+    // Opdracht
+    preg_match('#<assignment>([\S\s]+)</assignment>#', $match, $opdracht);
+    fwrite($txt, 'Opdracht:' . wiski_get_xml_text($opdracht[1]) . "\n");
+    // Opgave
+    preg_match('#<questiontext>([\S\s]+)</questiontext>#', $match, $opgave);
+    preg_match('#<image.+uri="(.+)".+#', $opgave[1], $imagename);
+    if (empty($imagename)) {
+      $image = '';
+    } else {
+      $imagepath = $path . '/' . $imagename[1];
+      $image = '<a href="/' . $imagepath . '" class="colorbox-load">';
+      $image .= '<img alt="" src="/' . $imagepath . '"/></a>';
+    }
+    fwrite($txt, 'Opgave:' . wiski_get_xml_text($opgave[1]) . $image . "\n");
+    // Opties
+    preg_match_all('#<answer([\S\s]+?)</answer>#', $match, $opties);
+    $correct = array();
+    foreach ($opties[0] as $key => $optie) {
+      fwrite($txt, 'Optie:' . wiski_get_xml_text($optie) . "\n");
+      preg_match('#fraction="(.+)" id=#', $optie, $fraction);
+      if ($fraction[1] != 0) {
+        $correct[] = $key;
+      }
+    }
+    // Correct
+    fwrite($txt, 'Correct:' . implode(',', $correct) . "\n\n");
+  }
+  fclose($txt);
+}
+
+/**
+* Geef de tekst in een xml-tag.
+*/
+function wiski_get_xml_text($xml) {
+  preg_match('#<text><!\[CDATA\[([\S\s]+)\]\]></text>#', $xml, $text);
+  if (empty($text)) {
+    return '';
+  } else {
+    $text = preg_replace('#\n#', ' ', $text[1]);
+    $text = preg_replace('#\s+#', ' ', $text);
+    return $text;
+  }
+}
+
+/**
+* Maak een multichoice met de gegeven info. https://www.drupal.org/project/quiz/issues/1892278
+*/
+function wiski_create_multichoice($jaar, $categorie, $oefening) {
+  $opgave = $oefening['opgave'] . ' ' . $oefening['opdracht'];
+  $title = substr($opgave, 0, 100);
+  $question = new stdClass();
+  $question->title = $title;
+  $question->type = 'multichoice';
+  $question->body[LANGUAGE_NONE][] = array(
+    'value' => $opgave,
+    'format' => 'full_html',
+  );
+  $question->choice_multi = 0;
+  $question->choice_random = 1;
+  $question->choice_boolean = 0;
+  $question->language = 'nl';
+  $question->uid = 1;
+  $question->status = 1;
+  foreach ($oefening['opties'] as $key => $optie) {
+    $question->alternatives[] = array(
+      'answer' => array(
+        'value' => $optie,
+        'format' => 'full_html',
+      ),
+      'feedback_if_chosen' => '',
+      'feedback_if_chosen_format' => 'filtered_html',
+      'feedback_if_not_chosen' => '',
+      'feedback_if_not_chosen_format' => 'filtered_html',
+      'score_if_chosen' => in_array($key, $oefening['correct']) ? 1 : 0,
+    );
+  }
+  $tid = wiski_get_category_tid($jaar, $categorie);
+  $question->field_onderwerp[LANGUAGE_NONE][0]['tid'] = $tid;
+  $question->comment = 2;
+  node_save($question);
+}
+
+/**
+* Maak indien nodig een nieuwe taxonomieterm voor de opgegeven categorie.
+*/
+function wiski_get_category_tid($jaar, $categorie) {
+  $vid = taxonomy_vocabulary_machine_name_load('onderwerpen')->vid;
+  $year = array (
+    'Basiskennis',
+    'Basiskennis',
+    '3de middelbaar en 4de middelbaar',
+    '3de middelbaar en 4de middelbaar',
+    '5de middelbaar en 6de middelbaar',
+    '5de middelbaar en 6de middelbaar',
+  );
+
+  // Zoek of maak de taxonomieterm voor het jaar.
+  $yearTerms = taxonomy_get_term_by_name($year[$jaar - 1], 'onderwerpen');
+  if (empty($yearTerms)) {
+    $yearTid = wiski_create_taxonomy_term($year, $vid);
+  } else {
+    $yearTid = reset($yearTerms)->tid;
+  }
+
+  // Ga na of er een taxonomieterm bestaat voor het onderwerp.
+  $categoryExists = FALSE;
+  $categorieTerm = taxonomy_get_term_by_name($categorie, 'onderwerpen');
+  if (!empty($categorieTerm)) {
+    $tid = reset($categorieTerm)->tid;
+    $parents = taxonomy_get_parents_all($tid);
+    if (isset($parents[2]) && $parents[2]->tid == $yearTid) {
+      $categoryExists = TRUE;
+    }
+  }
+
+  // Maak een taxonomieterm voor het onderwerp als die nog niet bestaat.
+  if (!$categoryExists) {
+    $tid = wiski_create_taxonomy_term($categorie, $vid);
+    $term = taxonomy_term_load($tid);
+    $term->parent = $yearTid;
+    taxonomy_term_save($term);
+  }
+
+  return $tid;
+}
+
+/**
+* Maak een nieuwe taxonomieterm.
+*/
+function wiski_create_taxonomy_term($naam, $vid) {
+  $term = new stdClass();
+  $term->name = $naam;
+  $term->vid = $vid;
+  taxonomy_term_save($term);
+  return $term->tid;
+}
+
+/**
+* Voorkom dat gebruikers de taal kunnen veranderen.
+*/
+function wiski_form_alter(&$form, $form_state, $form_id) {
+  // The language selector is only displayed if there is more than one language.
+  if (drupal_multilingual()) {
+    if ($form_id == 'user_register_form' || ($form_id == 'user_profile_form' && $form['#user_category'] == 'account')) {
+      if (count(element_children($form['locale'])) > 1) {
+        $form['locale']['language']['#access'] = FALSE;
+      }
+      else {
+        $form['locale']['#access'] = FALSE;
+      }
+    }
+  }
+}
+
+/**
+* Maak een quiz voor elk onderwerp.
+*/
+function wiski_create_quizzes() {
+  $tvid = taxonomy_vocabulary_machine_name_load('onderwerpen')->vid;
+  $tree = taxonomy_get_tree($tvid);
+
+  foreach ($tree as $key => $term) {
+    if ($term->depth != 0) {
+      wiski_create_quiz($term);
+    }
+  }
+}
+
+/**
+* Maak een quiz voor een specifiek onderwerp.
+*/
+function wiski_create_quiz($term) {
+  $tid = $term->tid;
+  $onderwerp = $term->name;
+
+  // Maak een nieuwe quiz.
+  $values = array(
+    'type' => 'quiz',
+    'uid' => 1,
+    'status' => 1,
+    'comment' => 0,
+    'promote' => 0,
+  );
+  $entity = entity_create('node', $values);
+  $ewrapper = entity_metadata_wrapper('node', $entity);
+  $ewrapper->title->set($onderwerp);
+  $ewrapper->language->set('nl');
+  $ewrapper->field_onderwerp->set($tid);
+  $ewrapper->save();
+
+  // Stel de vragen van de quiz in.
+  $nid = $ewrapper->nid->value();
+  $vid = $ewrapper->vid->value();
+  $quiz = node_load($nid, $vid);
+  $quiz->number_of_random_questions = 5;
+  $record['nid'] = $nid;
+  $record['vid'] = $vid;
+  $record['weight'] = 0;
+  $record['tid'] = $tid;
+  $record['max_score'] = 1;
+  $record['number'] = 5;
+  drupal_write_record('quiz_terms', $record);
+  node_save($quiz);
+}
+
+/**
+* Gepersonaliseerde gamification mechanics instellen voor een account.
+*/
+function wiski_gepersonaliseerde_gamification_mechanics_instellen($user) {
+  $group = field_group_load_field_group_by_identifier('group_verwachte_motivatie|user|user|form');
+  $fields = $group->children;
+
+  // Maak array van veldnamen en waarden.
+  foreach ($fields as $key => $field) {
+    $userfield = $user->$field;
+    $value = $userfield[LANGUAGE_NONE][0]['value'];
+    $motivation[$field] = $value;
+  }
+
+  // Sorteer volgens hoogste waarden.
+  // Doe eerst een shuffle voor willekeur bij ex aequos.
+  $motivation_fields = array_keys($motivation);
+  shuffle($motivation_fields);
+  foreach ($motivation_fields as $key => $motivation_field) {
+    $field = str_replace('motiv_', '', $motivation_field);
+    $random_motivation[$field] = $motivation[$motivation_field];
+  }
+  arsort($random_motivation);
+
+  // Schakel gamification mechanics met 3 hoogste waarden in.
+  $highest = array_slice($random_motivation, 0, 3);
+  foreach ($random_motivation as $field => $value) {
+    $enable[$field] = 0;
+    if (in_array($field, array_keys($highest))) {
+      $enable[$field] = 1;
+    }
+  }
+
+  wiski_gamification_mechanics_inschakelen($user, $enable);
+}
+
+/**
+* Willekeurige gamification mechanics instellen voor een account.
+*/
+function wiski_willekeurige_gamification_mechanics_instellen($user) {
+  $group = field_group_load_field_group_by_identifier('group_gamification_mechanics|user|user|form');
+  $fields = $group->children;
+  $chosen = array_rand($fields, 3);
+
+  foreach ($fields as $key => $field) {
+    $enable[$field] = 0;
+    if (in_array($key, array_values($chosen))) {
+      $enable[$field] = 1;
+    }
+  }
+
+  wiski_gamification_mechanics_inschakelen($user, $enable);
+}
+
+/**
+* Flag gamification mechanic nodes om mechanics in te schakelen.
+*/
+function wiski_gamification_mechanics_inschakelen($user, $enable) {
+  foreach ($enable as $field => $boolean) {
+    $view = views_get_view_result('gamification_mechanic_gekoppeld_aan_gebruikersveld', 'master', $field);
+    $nid = $view[0]->nid;
+    $flag = flag_get_flag('gamification_mechanic_inschakele');
+    if ($boolean) {
+      $flag->flag('flag', $nid);
+    } else {
+      $flag->flag('unflag', $nid);
+    }
+  }
+}
+
+/**
+* Aanbevolen gamification mechanics filteren.
+*/
+function wiski_preprocess_views_view_unformatted(&$vars) {
+  $name = $vars['view']->name;
+  $block = $vars['view']->current_display;
+  $uid = $vars['user']->uid;
+
+  if ($name == 'gamification_mechanics' && $block == 'aanbevolen') {
+    $results = $vars['view']->result;
+    $aanbevolen = array();
+
+    // Sla de nids van de aanbevolen mechanics op.
+    foreach ($results as $key => $result) {
+      $field_mechanic = $result->field_field_gebruikersveld[0]['rendered']['#markup'];
+      if (wiski_score_gamification_mechanic($uid, $field_mechanic) >= 4.5) {
+        $aanbevolen[] = $vars['rows'][$key];
+      }
+    }
+
+    $vars['rows'] = $aanbevolen;
+  }
+}
+
+function wiski_preprocess_views_view_table(&$vars) {
+  $name = $vars['view']->name;
+  $block = $vars['view']->current_display;
+
+  if ($name == 'gebruikersdata' && $block == 'voorkeuren') {
+    foreach ($vars['rows'] as $rowid => $row) {
+      $uid = $row['uid'];
+      foreach ($row as $fieldid => $field) {
+        if ($fieldid != 'uid') {
+          $field_mechanic = str_replace('field_motiv', 'field', $fieldid);
+          $vars['rows'][$rowid][$fieldid] = wiski_score_gamification_mechanic($uid, $field_mechanic);
+        }
+      }
+    }
+  }
+}
+
+/**
+* Bereken de aanbevelingsscore voor een gamification mechanic.
+*/
+function wiski_score_gamification_mechanic($uid, $field_mechanic) {
+  $scores = wiski_personality_scores();
+  $mechanic = str_replace('field_', '', $field_mechanic);
+
+  // Persoonlijke voorkeur
+  $user = user_load($uid);
+  $field_motiv = str_replace('field', 'field_motiv', $field_mechanic);
+  $field = $user->$field_motiv;
+  $voorkeur = $field[LANGUAGE_NONE][0]['value'];
+
+  // FMM score
+  $ffm = array (
+    'openness',
+    'conscienciousness',
+    'extraversion',
+    'agreeableness',
+    'neuroticism',
+  );
+  $ffm_total = 0;
+  foreach ($ffm as $key => $factor) {
+    $factor_field = 'field_' . $factor;
+    $field = $user->$factor_field;
+    $ffm_total += $field[LANGUAGE_NONE][0]['value'] / 5 * $scores[$mechanic][$factor];
+  }
+  $ffm_score = $ffm_total * 7 / 25;
+
+  // Hexad score
+  $hexad = array (
+    'philanthropist',
+    'socialiser',
+    'free_spirit',
+    'achiever',
+    'disruptor',
+    'player',
+  );
+  $hexad_total = 0;
+  foreach ($hexad as $key => $factor) {
+    $factor_field = 'field_' . $factor;
+    $field = $user->$factor_field;
+    $hexad_total += $field[LANGUAGE_NONE][0]['value'] / 28 * $scores[$mechanic][$factor];
+  }
+  $hexad_score = $hexad_total / 6;
+
+  // Overall score
+  return ($voorkeur + $ffm_score + $hexad_score) / 3;
+}
+
+function wiski_personality_scores() {
+  return array (
+    'points' => array (
+      'openness' => 5,
+      'conscienciousness' => 3,
+      'extraversion' => 4,
+      'agreeableness' => 3,
+      'neuroticism' => 4,
+      'philanthropist' => 4,
+      'socialiser' => 6,
+      'free_spirit' => 5,
+      'achiever' => 5,
+      'disruptor' => 5,
+      'player' => 7,
+    ),
+    'puntenklassement' => array (
+      'openness' => 3,
+      'conscienciousness' => 4,
+      'extraversion' => 5,
+      'agreeableness' => 4,
+      'neuroticism' => 3,
+      'philanthropist' => 4,
+      'socialiser' => 7,
+      'free_spirit' => 5,
+      'achiever' => 6,
+      'disruptor' => 6,
+      'player' => 6,
+    ),
+    'oefeningenklassement' => array (
+      'openness' => 3,
+      'conscienciousness' => 4,
+      'extraversion' => 5,
+      'agreeableness' => 4,
+      'neuroticism' => 3,
+      'philanthropist' => 4,
+      'socialiser' => 7,
+      'free_spirit' => 5,
+      'achiever' => 6,
+      'disruptor' => 6,
+      'player' => 6,
+    ),
+    'streak' => array (
+      'openness' => 3,
+      'conscienciousness' => 4,
+      'extraversion' => 3,
+      'agreeableness' => 3,
+      'neuroticism' => 5,
+      'philanthropist' => 5,
+      'socialiser' => 5,
+      'free_spirit' => 5,
+      'achiever' => 5,
+      'disruptor' => 4,
+      'player' => 6,
+    ),
+    'helping_platform' => array (
+      'openness' => 3,
+      'conscienciousness' => 4,
+      'extraversion' => 4,
+      'agreeableness' => 5,
+      'neuroticism' => 3,
+      'philanthropist' => 7,
+      'socialiser' => 6,
+      'free_spirit' => 5,
+      'achiever' => 6,
+      'disruptor' => 5,
+      'player' => 6,
+    ),
+    'challenges' => array (
+      'openness' => 4,
+      'conscienciousness' => 4,
+      'extraversion' => 3,
+      'agreeableness' => 4,
+      'neuroticism' => 2,
+      'philanthropist' => 5,
+      'socialiser' => 4,
+      'free_spirit' => 7,
+      'achiever' => 7,
+      'disruptor' => 5,
+      'player' => 6,
+    ),
+    'motiverende_feedback' => array (
+      'openness' => 5,
+      'conscienciousness' => 3,
+      'extraversion' => 4,
+      'agreeableness' => 3,
+      'neuroticism' => 3,
+      'philanthropist' => 4,
+      'socialiser' => 4,
+      'free_spirit' => 5,
+      'achiever' => 4,
+      'disruptor' => 5,
+      'player' => 5,
+    ),
+    'easter_eggs' => array (
+      'openness' => 4,
+      'conscienciousness' => 4,
+      'extraversion' => 4,
+      'agreeableness' => 3,
+      'neuroticism' => 5,
+      'philanthropist' => 5,
+      'socialiser' => 5,
+      'free_spirit' => 7,
+      'achiever' => 7,
+      'disruptor' => 5,
+      'player' => 7,
+    ),
+  );
+}
+
+/**
+* Kijk of er iets gelogd moet worden in de database.
+*/
+if (isset($_POST['action']) && isset($_POST['element'])) {
+  global $user;
+  $uid = $user->uid;
+
+  switch ($_POST['action']) {
+    case 'click':
+    wiski_log_click($_POST, $uid);
+    break;
+    case 'hover':
+    wiski_log_hover($_POST, $uid);
+    break;
+    case 'scroll':
+    wiski_log_scroll($_POST, $uid);
+    break;
+  }
+}
+
+/**
+* Log clicks.
+*/
+function wiski_log_click($data, $uid) {
+  $db = 'wiski_log_click';
+  if (db_table_exists($db)) {
+    $fields = array(
+      'uid' => $uid,
+      'element' => $data['element'],
+      'timestamp' => $data['timestamp'],
+    );
+    db_insert($db)
+    ->fields($fields)
+    ->execute();
+  }
+  exit;
+}
+
+/**
+* Log hovers.
+*/
+function wiski_log_hover($data, $uid) {
+  $db = 'wiski_log_hover';
+  if (db_table_exists($db)) {
+    $fields = array(
+      'uid' => $uid,
+      'element' => $data['element'],
+      'time_enter' => $data['timeEnter'],
+      'time_leave' => $data['timeLeave'],
+      'url' => $data['url'],
+    );
+    db_insert($db)
+    ->fields($fields)
+    ->execute();
+  }
+  exit;
+}
+
+/**
+* Log scroll op pagina 'Klassement'.
+*/
+function wiski_log_scroll($data, $uid) {
+  $db = 'wiski_log_scroll';
+  if (db_table_exists($db)) {
+    $ownScroll = ($data['ownScroll'] > 0) ? $data['ownScroll'] : NULL;
+    $fields = array(
+      'uid' => $uid,
+      'element' => $data['element'],
+      'scroll' => $data['scroll'],
+      'own_scroll' => $ownScroll,
+      'max_scroll' => $data['maxScroll'],
+      'time' => $data['timestamp'],
+    );
+    db_insert($db)
+    ->fields($fields)
+    ->execute();
+  }
+  exit;
+}
+
+/**
+* Unflag een entity in naam van een bepaalde gebruiker.
+*/
+function wiski_unflag($flag_name, $entity_id, $uid) {
+  $account = user_load($uid);
+  flag('unflag', $flag_name, $entity_id, $account);
+}
+
+/**
+* Optielijst voor webforms.
+*/
+function wiski_webform_select_options_info() {
+  $items = array();
+
+  $items['scores'] = array(
+    'title' => t('Evaluatie van gamification mechanics'),
+    'options callback' => 'webform_options_scores',
+  );
+
+  return $items;
+}
+
+function webform_options_scores($component, $flat, $arguments) {
+  return array(
+    '1' => t('Heel demotiverend'),
+    '2' => t('Demotiverend'),
+    '3' => t('Eerder demotiverend'),
+    '4' => t('Niet demotiverend, noch motiverend'),
+    '5' => t('Eerder motiverend'),
+    '6' => t('Motiverend'),
+    '7' => t('Heel motiverend'),
+    '8' => t('Ik zag deze techniek niet op Wiski')
+  );
+}

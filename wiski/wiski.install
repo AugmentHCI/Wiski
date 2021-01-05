@@ -1,0 +1,174 @@
+<?php
+
+/**
+* Maak een tabel voor het loggen van clicks.
+*/
+function wiski_update_7000() {
+  $table = array(
+    'description' => 'Log clicks on Wiski.',
+    'fields' => array(
+      'uid' => array(
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+        'default' => 0,
+      ),
+      'element' => array(
+        'type' => 'varchar',
+        'length' => 255,
+        'not null' => TRUE,
+        'default' => '',
+      ),
+      'timestamp' => array(
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'size' => 'big',
+        'not null' => TRUE,
+        'default' => 0,
+      ),
+    ),
+    'primary key' => array('uid', 'timestamp'),
+  );
+  db_create_table('wiski_log_click', $table);
+}
+
+/**
+* Maak een tabel voor het loggen van hovers.
+*/
+function wiski_update_7001() {
+  $table = array(
+    'description' => 'Log hovers on Wiski.',
+    'fields' => array(
+      'uid' => array(
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+        'default' => 0,
+      ),
+      'element' => array(
+        'type' => 'varchar',
+        'length' => 255,
+        'not null' => TRUE,
+        'default' => '',
+      ),
+      'time_enter' => array(
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'size' => 'big',
+        'not null' => TRUE,
+        'default' => 0,
+      ),
+      'time_leave' => array(
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'size' => 'big',
+        'not null' => TRUE,
+        'default' => 0,
+      ),
+    ),
+    'primary key' => array('uid', 'time_enter'),
+  );
+  db_create_table('wiski_log_hover', $table);
+}
+
+/**
+* Maak een tabel voor het loggen van scrolls.
+*/
+function wiski_update_7002() {
+  $table = array(
+    'description' => 'Log scrolls on Wiski.',
+    'fields' => array(
+      'uid' => array(
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+        'default' => 0,
+      ),
+      'element' => array(
+        'type' => 'varchar',
+        'length' => 255,
+        'not null' => TRUE,
+        'default' => '',
+      ),
+      'scroll' => array(
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+        'default' => 0,
+      ),
+      'own_scroll' => array(
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => FALSE,
+      ),
+      'max_scroll' => array(
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'not null' => TRUE,
+        'default' => 0,
+      ),
+      'time' => array(
+        'type' => 'int',
+        'unsigned' => TRUE,
+        'size' => 'big',
+        'not null' => TRUE,
+        'default' => 0,
+      ),
+    ),
+    'primary key' => array('uid', 'time'),
+  );
+  db_create_table('wiski_log_scroll', $table);
+}
+
+/**
+* Use autoincrement for row ids to avoid duplicates.
+*/
+function wiski_update_7003() {
+  wiski_add_primary_id('wiski_log_click');
+  wiski_add_primary_id('wiski_log_hover');
+  wiski_add_primary_id('wiski_log_scroll');
+}
+
+function wiski_add_primary_id($table) {
+  db_add_field($table, 'id', array(
+    'type' => 'int',
+    'unsigned' => TRUE,
+    'size' => 'normal',
+    'not null' => TRUE,
+    'default' => 0,
+  ));
+  db_add_index($table, 'temp', array('id'));
+  db_drop_primary_key($table);
+  db_change_field($table, 'id', 'id', array(
+    'type' => 'serial',
+    'unsigned' => TRUE,
+    'size' => 'normal',
+    'not null' => TRUE,
+  ),
+  array(
+    'primary key' => array('id'),
+  ));
+  db_drop_index($table, 'temp');
+}
+
+/**
+* Allow negative values for own_scroll.
+*/
+function wiski_update_7004() {
+  db_change_field('wiski_log_scroll', 'own_scroll', 'own_scroll', array(
+    'type' => 'int',
+    'unsigned' => FALSE,
+    'not null' => FALSE,
+  ));
+}
+
+/**
+* Add url field for hover logs.
+*/
+function wiski_update_7005() {
+  db_add_field('wiski_log_hover', 'url', array(
+    'type' => 'text',
+    'size' => 'small',
+    'not null' => FALSE,
+  ));
+}
